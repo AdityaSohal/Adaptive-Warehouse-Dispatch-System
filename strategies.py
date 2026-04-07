@@ -1,16 +1,26 @@
 """
-strategies.py
-4 assignment strategies. Each takes (tasks, agents, env) and returns
-{task_id: agent}. Agents list contains only idle, non-low-battery agents.
+strategies.py — 5 assignment strategies for the UCB1 bandit to choose among.
+
+Each strategy takes (tasks, agents, env) and returns {task_id: agent}.
+Only idle, non-critical-battery agents are passed in.
 """
 
+from __future__ import annotations
+
 import random
+from agent import Agent, AgentRole
+from task  import Task
+# forward ref to WarehouseEnvironment avoids circular import at runtime
 
 
-def nearest_agent_strategy(tasks, agents, env) -> dict:
-    """Assign each task to the closest available agent."""
-    assignments = {}
-    available   = list(agents)
+def nearest_agent_strategy(
+    tasks:  list[Task],
+    agents: list[Agent],
+    env,
+) -> dict[int, Agent]:
+    """Closest robot to each pickup zone — minimises deadhead distance."""
+    assignments: dict[int, Agent] = {}
+    available = list(agents)
     for task in tasks:
         if not available:
             break
@@ -20,85 +30,89 @@ def nearest_agent_strategy(tasks, agents, env) -> dict:
     return assignments
 
 
-def fastest_agent_strategy(tasks, agents, env) -> dict:
-    """Assign each task to the fastest available agent."""
-    assignments = {}
-    available   = sorted(agents, key=lambda a: -a.speed)
-    pool        = list(available)
-    for task in tasks:
-        if not pool:
+def fastest_agent_strategy(
+    tasks:  list[Task],
+    agents: list[Agent],
+    env,
+) -> dict[int, Agent]:
+    """Highest-speed robot first — good for CRITICAL orders."""
+    assignments: dict[int, Agent] = {}
+    pool = sorted(agents, key=lambda a: -a.speed)
+    for i, task in enumerate(tasks):
+        if i >= len(pool):
             break
-        assignments[task.id] = pool[0]
-        pool.pop(0)
+        assignments[task.id] = pool[i]
     return assignments
 
 
-def least_loaded_strategy(tasks, agents, env) -> dict:
-    """Assign each task to the agent with lowest load ratio."""
-    assignments = {}
-    available   = list(agents)
-
+def least_loaded_strategy(
+    tasks:  list[Task],
+    agents: list[Agent],
+    env,
+) -> dict[int, Agent]:
+    """Agent with fewest completed tasks — balances fleet utilisation."""
+    assignments: dict[int, Agent] = {}
+    available = list(agents)
     for task in tasks:
         if not available:
             break
-
-        best = min(
-            available,
-            key=lambda a: getattr(a, "current_load", 0) / max(getattr(a, "capacity", 1), 1)
-        )
-
+        best = min(available, key=lambda a: a.tasks_completed)
         assignments[task.id] = best
         available.remove(best)
-
     return assignments
 
 
-def random_strategy(tasks, agents, env) -> dict:
-    """Random assignment baseline."""
-    assignments = {}
-    pool = list(agents)
-    random.shuffle(pool)
+def random_strategy(
+    tasks:  list[Task],
+    agents: list[Agent],
+    env,
+) -> dict[int, Agent]:
+    """Random assignment — exploration baseline for the bandit."""
+    assignments: dict[int, Agent] = {}
+    pool = random.sample(agents, len(agents))
     for i, task in enumerate(tasks):
-        if not pool:
+        if i >= len(pool):
             break
-        agent = pool[i % len(pool)]
-        assignments[task.id] = agent
-        pool = [a for a in pool if a != agent]
+        assignments[task.id] = pool[i]
     return assignments
 
 
-def specialized_strategy(tasks, agents, env) -> dict:
+def specialized_strategy(
+    tasks:  list[Task],
+    agents: list[Agent],
+    env,
+) -> dict[int, Agent]:
     """
-    Role-aware assignment:
-      - heavy tasks  → HEAVY role agents first
-      - short tasks  → FAST  role agents first
-      - long tasks   → best by cost estimate
+    Role-aware + cost-minimising:
+      heavy tasks  → HEAVY agents first
+      short tasks  → FAST  agents first
+      long tasks   → lowest compute_cost among all available
+    Tie-break always on env.compute_cost.
     """
-    from agent import AgentRole
-    assignments = {}
-    available   = list(agents)
-
+    assignments: dict[int, Agent] = {}
+    available = list(agents)
     for task in tasks:
         if not available:
             break
         if task.category == 'heavy':
-            preferred = [a for a in available if a.role == AgentRole.HEAVY]
+            pool = [a for a in available if a.role == AgentRole.HEAVY] or available
         elif task.category == 'short':
-            preferred = [a for a in available if a.role == AgentRole.FAST]
+            pool = [a for a in available if a.role == AgentRole.FAST] or available
         else:
-            preferred = available
-
-        pool = preferred if preferred else available
+            pool = available
         best = min(pool, key=lambda a: env.compute_cost(a, task))
         assignments[task.id] = best
         available.remove(best)
     return assignments
 
 
-STRATEGY_REGISTRY = {
-    0: ('nearest_agent',  nearest_agent_strategy),
-    1: ('fastest_agent',  fastest_agent_strategy),
-    2: ('least_loaded',   least_loaded_strategy),
-    3: ('random',         random_strategy),
-    4: ('specialized',    specialized_strategy),
+# Registry consumed by StrategyBandit and Dispatcher
+STRATEGY_REGISTRY: dict[int, tuple[str, callable]] = {
+    0: ('nearest',     nearest_agent_strategy),
+    1: ('fastest',     fastest_agent_strategy),
+    2: ('balanced',    least_loaded_strategy),
+    3: ('random',      random_strategy),
+    4: ('specialized', specialized_strategy),
 }
+
+STRATEGY_NAMES = [v[0] for v in STRATEGY_REGISTRY.values()]

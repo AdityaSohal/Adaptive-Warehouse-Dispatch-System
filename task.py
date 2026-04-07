@@ -1,11 +1,14 @@
 """
-task.py
-Task / order with priority levels, categories, and full lifecycle tracking.
+task.py — Order lifecycle with 5 priority levels, category tags, and deadlines.
 """
 
 import random
 import time
 from enum import Enum, auto
+from config import (
+    PRIORITY_DEADLINES, HEAVY_WEIGHT_KG, SHORT_DIST_CELLS,
+    COL,
+)
 
 
 class Priority(Enum):
@@ -24,64 +27,48 @@ class TaskStatus(Enum):
     FAILED     = auto()
 
 
-PRIORITY_LABELS = {
-    Priority.LOW:      "LOW",
-    Priority.NORMAL:   "NORMAL",
-    Priority.HIGH:     "HIGH",
-    Priority.URGENT:   "URGENT",
-    Priority.CRITICAL: "CRITICAL",
-}
-
-PRIORITY_COLORS = {
-    Priority.LOW:      (100, 180, 100),
-    Priority.NORMAL:   (100, 160, 220),
-    Priority.HIGH:     (255, 200, 50),
-    Priority.URGENT:   (255, 140, 30),
-    Priority.CRITICAL: (220, 60,  60),
-}
+# ── Shared label / colour maps ──────────────────────────────────────────────────
+PRIORITY_NAMES  = {p: p.name for p in Priority}
+PRIORITY_COLORS = {p: COL['priority'][p.value] for p in Priority}
 
 
 class Task:
-    SHORT_DIST  = 6
-    HEAVY_WGHT  = 14.0
-
     _counter = 0
 
-    def __init__(self, pickup: tuple, drop: tuple,
-                 weight: float = None, priority: Priority = None,
-                 task_id: int = None):
+    def __init__(
+        self,
+        pickup:   tuple,
+        drop:     tuple,
+        weight:   float | None = None,
+        priority: Priority | None = None,
+        task_id:  int | None = None,
+    ):
         Task._counter += 1
         self.id       = task_id if task_id is not None else Task._counter
-        self.pickup   = pickup
-        self.drop     = drop
-        self.weight   = weight   if weight   is not None else round(random.uniform(1.0, 25.0), 1)
+        self.pickup   = tuple(pickup)
+        self.drop     = tuple(drop)
+        self.weight   = weight   if weight   is not None else round(random.uniform(1.0, 28.0), 1)
         self.priority = priority if priority is not None else random.choice(list(Priority))
 
-        self.status          = TaskStatus.PENDING
-        self.assigned_agent  = None
-        self.reward          = None
-        self.created_at      = time.time()
-        self.completed_at    = None
+        self.status         = TaskStatus.PENDING
+        self.assigned_agent = None
+        self.reward         = None
+        self.created_at     = time.time()
+        self.completed_at   = None
 
-        # Deadline: critical orders expire faster
-        deadline_seconds = {
-            Priority.LOW:      60,
-            Priority.NORMAL:   45,
-            Priority.HIGH:     30,
-            Priority.URGENT:   20,
-            Priority.CRITICAL: 12,
-        }
-        self.deadline = self.created_at + deadline_seconds[self.priority]
+        dl_secs         = PRIORITY_DEADLINES.get(self.priority.value, 60)
+        self.deadline   = self.created_at + dl_secs
 
+    # ── Derived properties ──────────────────────────────────────────────────────
     @property
     def distance(self) -> int:
-        return abs(self.drop[0]-self.pickup[0]) + abs(self.drop[1]-self.pickup[1])
+        return abs(self.drop[0] - self.pickup[0]) + abs(self.drop[1] - self.pickup[1])
 
     @property
     def category(self) -> str:
-        if self.weight >= self.HEAVY_WGHT:
+        if self.weight >= HEAVY_WEIGHT_KG:
             return 'heavy'
-        if self.distance <= self.SHORT_DIST:
+        if self.distance <= SHORT_DIST_CELLS:
             return 'short'
         return 'long'
 
@@ -98,44 +85,60 @@ class Task:
         return max(0.0, self.deadline - time.time())
 
     @property
-    def priority_color(self):
+    def urgency_ratio(self) -> float:
+        """0 = just created, 1 = deadline, >1 = past deadline."""
+        elapsed   = time.time() - self.created_at
+        total_ttl = self.deadline - self.created_at
+        return elapsed / max(total_ttl, 1e-6)
+
+    @property
+    def color(self) -> tuple:
         return PRIORITY_COLORS[self.priority]
 
-    def assign(self, agent):
+    # ── Lifecycle mutators ──────────────────────────────────────────────────────
+    def assign(self, agent) -> None:
         self.status         = TaskStatus.ASSIGNED
         self.assigned_agent = agent.id
 
-    def start_transit(self):
+    def start_transit(self) -> None:
         self.status = TaskStatus.IN_TRANSIT
 
-    def complete(self, reward: float):
+    def complete(self, reward: float) -> None:
         self.status       = TaskStatus.DELIVERED
         self.reward       = reward
         self.completed_at = time.time()
 
-    def fail(self):
+    def fail(self) -> None:
         self.status = TaskStatus.FAILED
 
-    def __lt__(self, other):
-        return self.priority_score > other.priority_score
+    # ── Comparison (for heapq) ──────────────────────────────────────────────────
+    def __lt__(self, other: 'Task') -> bool:
+        # Higher priority first; tie-break by deadline (sooner = more urgent)
+        if self.priority_score != other.priority_score:
+            return self.priority_score > other.priority_score
+        return self.deadline < other.deadline
 
-    def __repr__(self):
-        return (f"Task({self.id} {self.priority.name} "
-                f"pick={self.pickup} drop={self.drop} "
-                f"w={self.weight:.1f} cat={self.category})")
+    def __repr__(self) -> str:
+        return (
+            f"Task({self.id} {self.priority.name} "
+            f"pick={self.pickup} drop={self.drop} "
+            f"w={self.weight:.1f}kg cat={self.category} st={self.status.name})"
+        )
 
 
-def generate_tasks(n: int, grid_size: int,
-                   pickup_zones: list, drop_zones: list,
-                   force_priority: Priority = None) -> list:
+def generate_tasks(
+    n:            int,
+    grid_size:    int,
+    pickup_zones: list,
+    drop_zones:   list,
+    force_priority: Priority | None = None,
+) -> list[Task]:
+    """Generate n random tasks using the supplied zone lists."""
     tasks = []
     for _ in range(n):
         pickup = random.choice(pickup_zones)
-        drop   = random.choice(drop_zones)
-        while drop == pickup:
-            drop = random.choice(drop_zones)
-        weight   = round(random.uniform(1.0, 25.0), 1)
+        drop   = random.choice([d for d in drop_zones if d != pickup] or drop_zones)
+        weight   = round(random.uniform(1.0, 28.0), 1)
         priority = force_priority or random.choice(list(Priority))
-        tasks.append(Task(pickup=pickup, drop=drop,
-                          weight=weight, priority=priority))
+        tasks.append(Task(pickup=pickup, drop=drop, weight=weight, priority=priority))
     return tasks

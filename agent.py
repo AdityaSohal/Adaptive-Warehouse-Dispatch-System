@@ -1,178 +1,203 @@
 """
 agent.py
-Each agent has: A* pathfinding, local memory map, battery management,
-collision reservation, and a dynamically assigned role.
+Each robot has:
+  • A* pathfinding with space-time reservation conflict avoidance
+  • Local EMA congestion-cost memory
+  • Battery management with RL-guided charge decisions
+  • Smooth pixel-position interpolation for rendering
+  • Specialisation tracking (speed_runner / long_hauler / heavy_lifter)
 """
+
+from __future__ import annotations
 
 import heapq
 import random
 from collections import defaultdict
 from enum import Enum, auto
 
+from config import (
+    FAST_SPEED, HEAVY_SPEED,
+    FAST_CAPACITY, HEAVY_CAPACITY,
+    FAST_DRAIN, HEAVY_DRAIN,
+    CHARGE_RATE, BATTERY_FULL,
+    BATTERY_LOW, BATTERY_CRITICAL, BATTERY_RESUME,
+    SPEC_THRESHOLD, AGENT_LERP,
+)
+from rl_engine import AgentQLearner
 
+
+# ── Enums ───────────────────────────────────────────────────────────────────────
 class AgentRole(Enum):
-    FAST = "fast"
+    FAST  = "fast"
     HEAVY = "heavy"
 
 
 class AgentState(Enum):
-    IDLE = auto()
-    TO_PICKUP = auto()
-    TO_DROP = auto()
+    IDLE       = auto()
+    TO_PICKUP  = auto()
+    TO_DROP    = auto()
     TO_CHARGER = auto()
-    CHARGING = auto()
-    WAITING = auto()       # deadlock / collision hold
+    CHARGING   = auto()
+    WAITING    = auto()
 
 
+# ── Agent ───────────────────────────────────────────────────────────────────────
 class Agent:
-    BATTERY_DRAIN_PER_STEP = 1.2   # fast agents
-    HEAVY_DRAIN_PER_STEP   = 0.8   # heavy agents move slower, drain less per step
-    CHARGE_RATE            = 8.0   # % per tick while charging
-    LOW_BATTERY_THRESHOLD  = 25.0
-    FULL_BATTERY           = 100.0
-
-    ROLE_THRESHOLD = 6  # tasks before role locks in
 
     def __init__(self, agent_id: int, x: int, y: int, role: AgentRole):
-        self.id          = agent_id
-        self.x           = x
-        self.y           = y
-        self.role        = role
+        self.id    = agent_id
+        self.x     = x
+        self.y     = y
+        self.role  = role
 
         # Physics
-        self.speed = 2.0 if role == AgentRole.FAST else 1.0
-        self.capacity = 15.0 if role == AgentRole.FAST else 40.0
+        self.speed    = FAST_SPEED    if role == AgentRole.FAST else HEAVY_SPEED
+        self.capacity = FAST_CAPACITY if role == AgentRole.FAST else HEAVY_CAPACITY
+        self.drain    = FAST_DRAIN    if role == AgentRole.FAST else HEAVY_DRAIN
+
+        # Pixel position for smooth rendering
+        self.px: float = 0.0   # set by simulation after cell-size is known
+        self.py: float = 0.0
 
         # Battery
-        self.battery = self.FULL_BATTERY
-        self.drain   = self.BATTERY_DRAIN_PER_STEP if role == AgentRole.FAST else self.HEAVY_DRAIN_PER_STEP
+        self.battery = 65.0 + random.random() * 35.0
+        self.drain_per_step = self.drain
 
         # Task state
-        self.state          = AgentState.IDLE
-        self.current_task   = None
-        self.path           = []          # list of (x,y) waypoints from A*
-        self.wait_counter   = 0
+        self.state        = AgentState.IDLE
+        self.current_task = None
+        self.path: list   = []
+        self.wait_counter = 0
 
-        # Local memory: remembers congestion costs it has observed
-        # {(x,y): cost_penalty}  — shared read from environment but privately cached
+        # Carrying indicator (for rendering)
+        self.carrying = False
+
+        # Local congestion memory  {(x,y): penalty}
         self.memory_map: dict = {}
 
-        # Performance tracking
-        self.tasks_completed    = 0
-        self.total_reward       = 0.0
-        self.performance_history= []
-        self.spec_scores        = defaultdict(float)
-        self.spec_counts        = defaultdict(int)
-        self.specialization     = "generalist"
+        # Performance / specialisation
+        self.tasks_completed   = 0
+        self.total_reward      = 0.0
+        self.perf_history: list[float] = []
+        self.spec_scores       = defaultdict(float)
+        self.spec_counts       = defaultdict(int)
+        self.specialization    = "generalist"
 
-        # Pathfinding
-        self._grid_size  = None
-        self._obstacles  = None
+        # RL learner
+        self.ql = AgentQLearner()
 
-    # ──────────────────────────────────────────
-    # Location helpers
-    # ──────────────────────────────────────────
+    # ── Location helpers ────────────────────────────────────────────────────────
     @property
-    def location(self):
+    def location(self) -> tuple:
         return (self.x, self.y)
 
-    def move_to(self, x: int, y: int):
+    def move_to(self, x: int, y: int) -> None:
         self.x, self.y = x, y
 
-    # ──────────────────────────────────────────
-    # Battery
-    # ──────────────────────────────────────────
+    def lerp_pixel(self, cell_px: float, cell_py: float) -> None:
+        """Smoothly interpolate pixel position toward the target cell centre."""
+        self.px += (cell_px - self.px) * AGENT_LERP
+        self.py += (cell_py - self.py) * AGENT_LERP
+
+    # ── Battery ─────────────────────────────────────────────────────────────────
     def needs_charge(self) -> bool:
-        return self.battery <= self.LOW_BATTERY_THRESHOLD
+        return self.battery <= BATTERY_LOW
+
+    def critically_low(self) -> bool:
+        return self.battery <= BATTERY_CRITICAL
 
     def is_full(self) -> bool:
-        return self.battery >= self.FULL_BATTERY
+        return self.battery >= BATTERY_RESUME
 
-    def drain_battery(self):
-        self.battery = max(0.0, self.battery - self.drain)
+    def drain_battery(self) -> None:
+        prev = self.battery
+        self.battery = max(0.0, self.battery - self.drain_per_step)
+        if prev > 0 and self.battery == 0:
+            # Notify RL: very bad outcome
+            self.ql.reward_flat_battery(0, 0, False, False)
 
-    def charge_tick(self):
-        self.battery = min(self.FULL_BATTERY, self.battery + self.CHARGE_RATE)
+    def charge_tick(self) -> None:
+        self.battery = min(BATTERY_FULL, self.battery + CHARGE_RATE)
 
-    # ──────────────────────────────────────────
-    # A* pathfinding
-    # ──────────────────────────────────────────
-    def compute_path(self, start: tuple, goal: tuple,
-                     grid_size: int, obstacles: set,
-                     reserved: dict = None) -> list:
+    # ── A* pathfinding ──────────────────────────────────────────────────────────
+    def compute_path(
+        self,
+        start:     tuple,
+        goal:      tuple,
+        grid_size: int,
+        obstacles: set,
+        reserved:  dict | None = None,
+    ) -> list:
         """
-        A* from start to goal on a Manhattan grid.
-        obstacles: set of (x,y) cells that are walls / shelves.
-        reserved:  {(x,y,t): agent_id} — space-time reservations for collision avoidance.
-        Returns list of (x,y) cells from start (exclusive) to goal (inclusive).
+        Space-time A* from start → goal.
+        Falls back to greedy Manhattan if no path found.
         """
-        self._grid_size = grid_size
-        self._obstacles = obstacles
+        def h(a: tuple, b: tuple) -> float:
+            return abs(a[0] - b[0]) + abs(a[1] - b[1])
 
-        def h(a, b):
-            return abs(a[0]-b[0]) + abs(a[1]-b[1])
-
-        def neighbors(pos, t):
-            x, y = pos
-            dirs = [(0,1),(0,-1),(1,0),(-1,0),(0,0)]  # include wait-in-place
+        def neighbours(pos: tuple, t: int) -> list:
+            x, y   = pos
             result = []
-            for dx, dy in dirs:
-                nx, ny = x+dx, y+dy
-                if 0 <= nx < grid_size and 0 <= ny < grid_size:
-                    if (nx, ny) not in obstacles:
-                        # Check space-time reservation
-                        if reserved and (nx, ny, t+1) in reserved and reserved[(nx,ny,t+1)] != self.id:
+            for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0), (0, 0)):
+                nx, ny = x + dx, y + dy
+                if not (0 <= nx < grid_size and 0 <= ny < grid_size):
+                    continue
+                if (nx, ny) in obstacles and (nx, ny) != goal:
+                    continue
+                if reserved:
+                    t1 = t + 1
+                    # Future cell occupied by another agent?
+                    if (nx, ny, t1) in reserved and reserved[(nx, ny, t1)] != self.id:
+                        continue
+                    # Swap conflict (two agents crossing each other)
+                    if (nx, ny, t) in reserved and (x, y, t1) in reserved:
+                        if reserved.get((nx, ny, t)) not in (None, self.id) \
+                           and reserved.get((x, y, t1)) not in (None, self.id):
                             continue
-                        # Swap conflict: agents crossing each other
-                        if reserved and (nx, ny, t) in reserved and (x, y, t+1) in reserved:
-                            if reserved.get((nx,ny,t)) != self.id and reserved.get((x,y,t+1)) != self.id:
-                                continue
-                        result.append((nx, ny))
+                result.append((nx, ny))
             return result
 
-        open_heap = []
-        heapq.heappush(open_heap, (h(start, goal), 0, start, []))
-        visited = {}
+        open_heap = [(h(start, goal), 0.0, 0, start, [])]
+        visited: dict = {}
 
         while open_heap:
-            est, cost, pos, path = heapq.heappop(open_heap)
-            t = cost
+            _, cost, t, pos, path = heapq.heappop(open_heap)
 
             if pos == goal:
                 self.path = path + [goal]
                 return self.path
 
-            state_key = (pos, min(t, 20))  # cap time for memory
+            state_key = (pos, min(t, 25))
             if state_key in visited and visited[state_key] <= cost:
                 continue
             visited[state_key] = cost
 
-            for npos in neighbors(pos, t):
-                # Use memory map for congestion cost
-                extra = self.memory_map.get(npos, 0.0)
-                move_cost = 1 + extra
-                new_cost = cost + move_cost
-                est_total = new_cost + h(npos, goal)
-                heapq.heappush(open_heap, (est_total, new_cost, npos, path + [npos]))
+            for npos in neighbours(pos, t):
+                extra    = self.memory_map.get(npos, 0.0)
+                new_cost = cost + 1.0 + extra
+                heapq.heappush(
+                    open_heap,
+                    (new_cost + h(npos, goal), new_cost, t + 1, npos, path + [npos]),
+                )
 
-        # No path found — return direct Manhattan path as fallback
-        fallback = self._manhattan_fallback(start, goal, grid_size, obstacles)
-        self.path = fallback
-        return fallback
+        # Fallback
+        self.path = self._manhattan_fallback(start, goal, grid_size, obstacles)
+        return self.path
 
-    def _manhattan_fallback(self, start, goal, grid_size, obstacles):
-        """Simple greedy fallback if A* finds nothing."""
-        path = []
+    def _manhattan_fallback(
+        self, start: tuple, goal: tuple, grid_size: int, obstacles: set
+    ) -> list:
+        path: list = []
         x, y = start
         tx, ty = goal
-        for _ in range(grid_size * 2):
+        for _ in range(grid_size * 3):
             if x == tx and y == ty:
                 break
             options = []
-            if x < tx: options.append((x+1, y))
-            if x > tx: options.append((x-1, y))
-            if y < ty: options.append((x, y+1))
-            if y > ty: options.append((x, y-1))
+            if x < tx: options.append((x + 1, y))
+            if x > tx: options.append((x - 1, y))
+            if y < ty: options.append((x, y + 1))
+            if y > ty: options.append((x, y - 1))
             moved = False
             for opt in options:
                 if opt not in obstacles and 0 <= opt[0] < grid_size and 0 <= opt[1] < grid_size:
@@ -181,58 +206,72 @@ class Agent:
                     moved = True
                     break
             if not moved:
-                path.append((x, y))  # wait in place
+                # Side-step
+                for dx, dy in ((0, 1), (0, -1), (1, 0), (-1, 0)):
+                    nx, ny = x + dx, y + dy
+                    if (nx, ny) not in obstacles and 0 <= nx < grid_size and 0 <= ny < grid_size:
+                        x, y = nx, ny
+                        path.append((x, y))
+                        break
+                else:
+                    path.append((x, y))  # wait
         return path
 
     def step_path(self) -> tuple:
-        """
-        Advance one step along the computed path.
-        Returns the next cell, or current cell if path is empty.
-        """
+        """Advance one step; drain battery; return new location."""
         if self.path:
             next_pos = self.path.pop(0)
             self.move_to(*next_pos)
             self.drain_battery()
         return self.location
 
-    def update_memory(self, pos: tuple, congestion_cost: float):
-        """Learn the congestion cost for a cell."""
-        # Exponential moving average
+    # ── Memory ──────────────────────────────────────────────────────────────────
+    def update_memory(self, pos: tuple, congestion_cost: float) -> None:
         old = self.memory_map.get(pos, 0.0)
         self.memory_map[pos] = 0.8 * old + 0.2 * congestion_cost
 
-    # ──────────────────────────────────────────
-    # Performance / specialization
-    # ──────────────────────────────────────────
-    def record_task(self, reward: float, category: str):
+    # ── Specialisation / reward ─────────────────────────────────────────────────
+    def record_task(self, reward: float, category: str, queue_len: int,
+                    has_critical: bool) -> None:
         self.tasks_completed += 1
         self.total_reward    += reward
-        self.performance_history.append(reward)
+        self.perf_history.append(reward)
+        if len(self.perf_history) > 100:
+            self.perf_history.pop(0)
         self.spec_scores[category] += reward
         self.spec_counts[category] += 1
         self._update_specialization()
+        self.ql.reward_delivery(
+            priority_val  = int(getattr(self.current_task, 'priority_score', 2)) if self.current_task else 2,
+            battery       = self.battery,
+            queue_len     = queue_len,
+            has_critical  = has_critical,
+            is_working    = False,
+        )
 
-    def _update_specialization(self):
+    def _update_specialization(self) -> None:
         eligible = {
             cat: self.spec_scores[cat] / self.spec_counts[cat]
-            for cat in ['short', 'long', 'heavy']
-            if self.spec_counts[cat] >= self.ROLE_THRESHOLD
+            for cat in ('short', 'long', 'heavy')
+            if self.spec_counts[cat] >= SPEC_THRESHOLD
         }
         if not eligible:
             self.specialization = "generalist"
             return
         best = max(eligible, key=eligible.get)
-        self.specialization = {'short': 'speed_runner',
-                               'long':  'long_hauler',
-                               'heavy': 'heavy_lifter'}[best]
+        self.specialization = {
+            'short': 'runner', 'long': 'hauler', 'heavy': 'lifter'
+        }[best]
 
     @property
-    def avg_reward(self):
-        if not self.performance_history:
+    def avg_reward(self) -> float:
+        if not self.perf_history:
             return 0.0
-        return sum(self.performance_history) / len(self.performance_history)
+        return sum(self.perf_history) / len(self.perf_history)
 
-    def __repr__(self):
-        return (f"Agent({self.id},{self.role.value}) "
-                f"pos={self.location} batt={self.battery:.0f}% "
-                f"state={self.state.name}")
+    def __repr__(self) -> str:
+        return (
+            f"Agent({self.id},{self.role.value}) "
+            f"pos={self.location} batt={self.battery:.0f}% "
+            f"state={self.state.name}"
+        )
