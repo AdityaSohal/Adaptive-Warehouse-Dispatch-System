@@ -1,3 +1,6 @@
 pygame>=2.1.0
 numpy>=1.21.0
 matplotlib>=3.5.0
+# Optional but recommended:
+# scipy>=1.9.0        — enables true Hungarian (linear_sum_assignment); falls back to pure-Python otherwise
+# torch>=2.0.0        — enables full PyTorch MAPPO; falls back to NumPy approximation otherwise
