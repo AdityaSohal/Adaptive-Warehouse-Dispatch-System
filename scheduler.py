@@ -88,6 +88,7 @@ def _hungarian_pure(cost_matrix: list[list[float]]) -> list[tuple[int, int]]:
     n = len(cost_matrix)
     m = len(cost_matrix[0]) if n > 0 else 0
     sz = max(n, m)
+
     # Pad to square
     C = [[cost_matrix[i][j] if i < n and j < m else 1e9 for j in range(sz)] for i in range(sz)]
 
@@ -101,11 +102,13 @@ def _hungarian_pure(cost_matrix: list[list[float]]) -> list[tuple[int, int]]:
         j0   = 0
         minv = [1e18] * (sz + 1)
         used = [False] * (sz + 1)
+
         while True:
             used[j0] = True
             i0 = p[j0]
             delta = 1e18
             j1    = -1
+
             for j in range(1, sz + 1):
                 if not used[j]:
                     cur = C[i0 - 1][j - 1] - u[i0] - v[j]
@@ -115,15 +118,18 @@ def _hungarian_pure(cost_matrix: list[list[float]]) -> list[tuple[int, int]]:
                     if minv[j] < delta:
                         delta = minv[j]
                         j1    = j
+
             for j in range(sz + 1):
                 if used[j]:
                     u[p[j]] += delta
                     v[j]    -= delta
                 else:
                     minv[j] -= delta
+
             j0 = j1
             if p[j0] == 0:
                 break
+
         while j0:
             p[j0] = p[way[j0]]
             j0    = way[j0]
@@ -132,11 +138,12 @@ def _hungarian_pure(cost_matrix: list[list[float]]) -> list[tuple[int, int]]:
     for j in range(1, sz + 1):
         if p[j] != 0 and p[j] - 1 < n and j - 1 < m:
             assignments.append((p[j] - 1, j - 1))
+
     return assignments
 
 
 def hungarian_assign(
-    tasks:  list,
+    tasks: list,
     agents: list,
     env,
 ) -> dict[int, object]:
@@ -162,6 +169,7 @@ def hungarian_assign(
 
     assignments: dict[int, object] = {}
     assigned_agents: set[int] = set()
+
     for t_idx, a_idx in pairs:
         if t_idx < len(tasks) and a_idx < len(agents):
             agent = agents[a_idx]
@@ -177,31 +185,30 @@ def hungarian_assign(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def auction_assign(
-    tasks:  list,
+    tasks: list,
     agents: list,
     env,
     rounds: int = 3,
 ) -> dict[int, object]:
     """
     Iterative auction: tasks broadcast, agents submit bids, highest-priority
-    task is awarded to the lowest bidder.  Repeat for remaining tasks.
+    task is awarded to the lowest bidder. Repeat for remaining tasks.
 
     Each bid = assignment_cost (lower cost = better bid = preferred).
     """
     assignments: dict[int, object] = {}
     available_agents = list(agents)
+
     # Sort tasks by priority descending so critical tasks are auctioned first
     remaining_tasks = sorted(tasks, key=lambda t: -t.priority_score)
 
     for task in remaining_tasks:
         if not available_agents:
             break
-        # Each available agent submits a bid
-        bids = [
-            (assignment_cost(agent, task, env), agent)
-            for agent in available_agents
-        ]
+
+        bids = [(assignment_cost(agent, task, env), agent) for agent in available_agents]
         bids.sort(key=lambda b: b[0])
+
         winner = bids[0][1]
         assignments[task.id] = winner
         available_agents.remove(winner)
@@ -227,8 +234,12 @@ class ChargingScheduler:
 
     def __init__(self, charging_stations: list):
         self.stations = charging_stations
+
         # {station_id: [(agent_id, reserved_tick)]}
         self._reservations: dict[int, list[tuple[int, int]]] = defaultdict(list)
+
+        # Environment reference (set later)
+        self._env = None
 
     # ── Internal helpers ────────────────────────────────────────────────────────
 
@@ -244,36 +255,39 @@ class ChargingScheduler:
         """How many agents are reserved for this station in the near future."""
         window = [
             r for r in self._reservations[station_id]
-            if r[1] >= tick and r[1] <= tick + CHARGE_RESERVE_WINDOW
+            if tick <= r[1] <= tick + CHARGE_RESERVE_WINDOW
         ]
         return len(window)
 
-    def _best_available_station(
-        self, agent, tick: int
-    ) -> Optional[object]:
-        """Return the station with the shortest queue nearest to the agent."""
-        from agent import AgentState
-        env = getattr(self, "_env", None)
+    def _best_available_station(self, agent, tick: int) -> Optional[object]:
+        """
+        Return the best station based on:
+        - lowest queue depth
+        - shortest distance
+        - stable tie-break using station.id
+        """
+        env = self._env
 
         candidates = []
         for station in self.stations:
             qd = self._station_queue_depth(station.id, tick)
             if qd >= CHARGE_MAX_QUEUE:
                 continue
-            dist = (
-                env.manhattan(agent.location, station.location)
-                if env else 0
-            )
+
+            dist = env.manhattan(agent.location, station.location) if env else 0
             candidates.append((qd, dist, station))
 
         if not candidates:
             # All queues full; pick nearest anyway
             candidates = [
-                (0, 0 if not env else env.manhattan(agent.location, s.location), s)
+                (0, env.manhattan(agent.location, s.location) if env else 0, s)
                 for s in self.stations
             ]
 
-        candidates.sort()
+        # FIX: sort only by queue depth + distance + station.id
+        # Avoid comparing ChargingStation objects directly
+        candidates.sort(key=lambda x: (x[0], x[1], x[2].id))
+
         return candidates[0][2] if candidates else None
 
     # ── Main API ────────────────────────────────────────────────────────────────
@@ -283,9 +297,10 @@ class ChargingScheduler:
 
     def predict_battery_after_task(self, agent, task) -> float:
         """Estimate remaining battery after completing the current task."""
-        env = getattr(self, "_env", None)
+        env = self._env
         if task is None or env is None:
             return agent.battery
+
         pickup_dist = env.manhattan(agent.location, task.pickup)
         total_dist  = pickup_dist + task.distance
         return agent.battery - total_dist * agent.drain_per_step
@@ -293,13 +308,11 @@ class ChargingScheduler:
     def should_charge_now(
         self,
         agent,
-        agents:       list,
-        tick:         int,
+        agents: list,
+        tick: int,
         has_critical: bool,
     ) -> bool:
-        """
-        Return True if the agent should divert to a charger right now.
-        """
+        """Return True if the agent should divert to a charger right now."""
         from agent import AgentState
 
         # Already charging
@@ -328,8 +341,6 @@ class ChargingScheduler:
 
         # Q-learner decision
         if hasattr(agent, "ql"):
-            from dispatcher import _pending_count, _has_critical
-            # Use stored values if available; else fallback
             return agent.ql.decide_charge(
                 battery      = agent.battery,
                 queue_len    = 0,
@@ -365,7 +376,4 @@ class ChargingScheduler:
             ]
 
     def charging_summary(self) -> dict:
-        return {
-            sid: len(rlist)
-            for sid, rlist in self._reservations.items()
-        }
+        return {sid: len(rlist) for sid, rlist in self._reservations.items()}
