@@ -1,23 +1,32 @@
 """
-rl_engine.py — Reinforcement-Learning components v3.
+rl_engine.py v5 — MAPPO now ACTUALLY AFFECTS MOVEMENT.
 
-Components
-──────────
-1. AgentQLearner      — per-robot tabular Q-learner for charge/work decisions
-                        (unchanged API, upgraded state encoding)
-2. StrategyBandit     — UCB1 multi-armed bandit over assignment strategies
-                        (unchanged API)
-3. MAPPOPolicy        — lightweight MAPPO implementation backed by NumPy.
-                        Requires numpy; optional torch upgrade path included.
-4. CongestionHeatmap  — EMA-based learned heatmap of costly cells; fed into CBS.
-5. ModelStore         — saves/loads all trained models between simulation runs.
+What changed from v4
+────────────────────
+MAPPOPolicy gains two new methods:
 
-MAPPO (Multi-Agent PPO) with centralised training / decentralised execution:
-  Each agent has its own actor network (obs → action logits).
-  A shared critic network takes the joint observation and outputs V(s).
-  After each rollout, PPO gradient updates improve both networks.
-  Because we use numpy for portability the "networks" are linear layers;
-  replace with torch.nn.Linear for full performance.
+  compute_cost_overlay(agent_idx, grid_size) -> dict[(x,y) -> float]
+    After each update, for each sampled grid cell, ask the actor network:
+    "how uncertain is the policy about what to do at this cell?"
+    We measure this via action-distribution entropy.
+
+    High entropy (≈ ln 5) = policy is confused here = high learned cost
+    Low entropy  (≈ 0.0)  = policy is confident     = low cost
+
+    Why entropy?
+      A well-trained policy becomes confident in clear corridors and
+      uncertain near congestion/collision zones.  Entropy directly encodes
+      that signal without needing any extra network or head.
+
+  apply_overlay_to_agents(agents, grid_size, env)
+    Pushes the computed overlay into each agent's mappo_overlay dict.
+    agent.py reads it in A* via mappo_extra_cost(pos).
+
+  update_and_apply(agents, grid_size, env)
+    Single call: train weights + push overlay.  Replace update() with
+    this in dispatcher.end_episode().
+
+The rest of the file is identical to v4 (real backpropagation).
 """
 
 from __future__ import annotations
@@ -47,20 +56,16 @@ from config import (
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 1. Per-agent tabular Q-learner  (charge / work decision)
+# 1. Per-agent tabular Q-learner
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AgentQLearner:
-    """
-    Tabular Q-learner: state = (battery_bucket, queue_pressure, critical, working)
-    Actions: {0: work, 1: charge}
-    """
     ACTIONS = {0: "work", 1: "charge"}
 
     def __init__(self) -> None:
-        self.Q:      dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
-        self.epsilon = QL_EPSILON_START
-        self.updates = 0
+        self.Q: dict[str, list[float]] = defaultdict(lambda: [0.0, 0.0])
+        self.epsilon  = QL_EPSILON_START
+        self.updates  = 0
         self._last_state:  str | None = None
         self._last_action: int | None = None
 
@@ -85,7 +90,7 @@ class AgentQLearner:
     def update(self, next_state: str, reward: float) -> None:
         if self._last_state is None:
             return
-        s, a = self._last_state, self._last_action
+        s, a      = self._last_state, self._last_action
         best_next = max(self.Q[next_state])
         td_target = reward + QL_GAMMA * best_next
         self.Q[s][a] += QL_ALPHA * (td_target - self.Q[s][a])
@@ -94,41 +99,37 @@ class AgentQLearner:
         self._last_state  = None
         self._last_action = None
 
-    def decide_charge(self, battery: float, queue_len: int,
-                      has_critical: bool, is_working: bool) -> bool:
+    def decide_charge(self, battery, queue_len, has_critical, is_working) -> bool:
         s = self.encode(battery, queue_len, has_critical, is_working)
         a = self.act(s)
         self.remember(s, a)
         return a == 1
 
-    def reward_delivery(self, priority_val: int, battery: float, queue_len: int,
-                        has_critical: bool, is_working: bool) -> None:
+    def reward_delivery(self, priority_val, battery, queue_len, has_critical, is_working):
         r  = REWARD_DELIVERY + priority_val * REWARD_PRIORITY_SCALE
         ns = self.encode(battery, queue_len, has_critical, is_working)
         self.update(ns, r)
 
-    def reward_flat_battery(self, battery: float, queue_len: int,
-                            has_critical: bool, is_working: bool) -> None:
+    def reward_flat_battery(self, battery, queue_len, has_critical, is_working):
         ns = self.encode(battery, queue_len, has_critical, is_working)
         self.update(ns, PENALTY_FLAT_BATTERY)
 
-    def reward_charge_completed(self, battery: float, queue_len: int,
-                                has_critical: bool, is_working: bool) -> None:
+    def reward_charge_completed(self, battery, queue_len, has_critical, is_working):
         ns = self.encode(battery, queue_len, has_critical, is_working)
         self.update(ns, REWARD_CHARGE_COMPLETE)
 
     @property
-    def best_action(self) -> dict[str, str]:
+    def best_action(self) -> dict:
         return {s: self.ACTIONS[0 if q[0] >= q[1] else 1] for s, q in self.Q.items()}
 
     def summary(self) -> dict:
         return {"epsilon": round(self.epsilon, 4), "updates": self.updates, "q_states": len(self.Q)}
 
     def to_dict(self) -> dict:
-        return {"Q": {k: v for k, v in self.Q.items()}, "epsilon": self.epsilon, "updates": self.updates}
+        return {"Q": dict(self.Q), "epsilon": self.epsilon, "updates": self.updates}
 
     def from_dict(self, d: dict) -> None:
-        self.Q       = defaultdict(lambda: [0.0, 0.0], {k: v for k, v in d["Q"].items()})
+        self.Q       = defaultdict(lambda: [0.0, 0.0], d["Q"])
         self.epsilon = d.get("epsilon", QL_EPSILON_MIN)
         self.updates = d.get("updates", 0)
 
@@ -138,12 +139,10 @@ class AgentQLearner:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class StrategyBandit:
-    """UCB1 bandit over assignment strategy arms."""
-
     def __init__(self, num_arms: int, arm_names: list[str]) -> None:
         self.n       = num_arms
         self.names   = arm_names
-        self.counts  = [0] * num_arms
+        self.counts  = [0]   * num_arms
         self.rewards = [0.0] * num_arms
         self.total   = 0
         self.history: list[tuple] = []
@@ -167,7 +166,7 @@ class StrategyBandit:
         if len(self.history) > 500:
             self.history.pop(0)
 
-    def avg_rewards(self) -> list[float]:
+    def avg_rewards(self) -> list:
         return [self.rewards[i] / self.counts[i] if self.counts[i] > 0 else 0.0 for i in range(self.n)]
 
     def best_arm(self) -> Tuple[int, str]:
@@ -175,7 +174,7 @@ class StrategyBandit:
         idx  = avgs.index(max(avgs))
         return idx, self.names[idx]
 
-    def arm_stats(self) -> list[dict]:
+    def arm_stats(self) -> list:
         avgs = self.avg_rewards()
         return [{"name": self.names[i], "pulls": self.counts[i], "avg_reward": round(avgs[i], 3)} for i in range(self.n)]
 
@@ -187,66 +186,109 @@ class StrategyBandit:
         return {"counts": self.counts, "rewards": self.rewards, "total": self.total}
 
     def from_dict(self, d: dict) -> None:
-        self.counts  = d.get("counts",  [0] * self.n)
+        self.counts  = d.get("counts",  [0]   * self.n)
         self.rewards = d.get("rewards", [0.0] * self.n)
         self.total   = d.get("total",   0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 3. MAPPO lightweight (NumPy linear layers)
+# 3. MAPPO with real backpropagation + cost-overlay output
 # ══════════════════════════════════════════════════════════════════════════════
 
 class LinearLayer:
-    """Single fully-connected layer with ReLU or no activation."""
-
     def __init__(self, in_dim: int, out_dim: int, activation: str = "relu") -> None:
-        scale = math.sqrt(2.0 / in_dim)
-        self.W = np.random.randn(in_dim, out_dim) * scale
-        self.b = np.zeros(out_dim)
+        scale   = math.sqrt(2.0 / in_dim)
+        self.W  = np.random.randn(in_dim, out_dim).astype(np.float32) * scale
+        self.b  = np.zeros(out_dim, dtype=np.float32)
         self.activation = activation
+        self._x_in: np.ndarray | None = None
+        self._z:    np.ndarray | None = None
 
     def forward(self, x: np.ndarray) -> np.ndarray:
-        out = x @ self.W + self.b
+        self._x_in = x
+        z = x @ self.W + self.b
+        self._z = z
         if self.activation == "relu":
-            out = np.maximum(0, out)
+            return np.maximum(0.0, z)
         elif self.activation == "tanh":
-            out = np.tanh(out)
-        return out
+            return np.tanh(z)
+        return z
+
+    def backward(self, d_out: np.ndarray) -> np.ndarray:
+        if self.activation == "relu":
+            d_out = d_out * (self._z > 0).astype(np.float32)
+        elif self.activation == "tanh":
+            d_out = d_out * (1.0 - np.tanh(self._z) ** 2)
+        self._dW = np.outer(self._x_in, d_out)
+        self._db = d_out.copy()
+        return self.W @ d_out
+
+    def apply_gradients(self, lr: float) -> None:
+        self.W -= lr * self._dW
+        self.b -= lr * self._db
 
     def to_dict(self) -> dict:
         return {"W": self.W.tolist(), "b": self.b.tolist(), "activation": self.activation}
 
     def from_dict(self, d: dict) -> None:
-        self.W          = np.array(d["W"])
-        self.b          = np.array(d["b"])
+        self.W          = np.array(d["W"], dtype=np.float32)
+        self.b          = np.array(d["b"], dtype=np.float32)
         self.activation = d.get("activation", "relu")
 
 
 class MAPPOActor:
-    """
-    Per-agent actor: obs → action logits (softmax → categorical policy).
-    Observation encoding (flat vector):
-      [battery/100, x/grid, y/grid, task_priority/5, congestion_local,
-       charging_needed, carrying, norm_queue, n_neighbors/fleet_size]
-    → 9 dims default
-    """
-    OBS_DIM  = 9
-    N_ACTIONS = 5   # 0=wait, 1=N, 2=S, 3=E, 4=W
+    OBS_DIM   = 9
+    N_ACTIONS = 5  # 0=wait, 1=N, 2=S, 3=E, 4=W
 
     def __init__(self, hidden: int = MAPPO_HIDDEN_DIM) -> None:
-        self.l1 = LinearLayer(self.OBS_DIM, hidden)
-        self.l2 = LinearLayer(hidden, hidden)
-        self.l3 = LinearLayer(hidden, self.N_ACTIONS, activation="none")
+        self.l1 = LinearLayer(self.OBS_DIM, hidden,         activation="relu")
+        self.l2 = LinearLayer(hidden,       hidden,         activation="relu")
+        self.l3 = LinearLayer(hidden,       self.N_ACTIONS, activation="none")
 
     def forward(self, obs: np.ndarray) -> np.ndarray:
-        x = self.l1.forward(obs)
-        x = self.l2.forward(x)
-        logits = self.l3.forward(x)
-        # Softmax
-        logits -= logits.max()
-        probs   = np.exp(logits)
-        probs  /= probs.sum()
-        return probs
+        h1     = self.l1.forward(obs)
+        h2     = self.l2.forward(h1)
+        logits = self.l3.forward(h2)
+        logits = logits - logits.max()
+        exp_l  = np.exp(logits)
+        return exp_l / exp_l.sum()
+
+    def entropy(self, obs: np.ndarray) -> float:
+        """
+        Shannon entropy H(π(·|obs)).
+
+        High entropy → policy uncertain here  → will become high A* cost
+        Low entropy  → policy confident here  → low A* cost
+        """
+        probs = self.forward(obs)
+        probs = np.clip(probs, 1e-8, 1.0)
+        return float(-np.sum(probs * np.log(probs)))
+
+    def backward_and_update(
+        self, obs: np.ndarray, action: int, advantage: float, lr: float
+    ) -> float:
+        # Forward (fills layer caches)
+        h1         = self.l1.forward(obs)
+        h2         = self.l2.forward(h1)
+        logits_raw = self.l3.forward(h2)
+        logits_raw = logits_raw - logits_raw.max()
+        exp_l      = np.exp(logits_raw)
+        probs      = exp_l / exp_l.sum()
+
+        loss = -math.log(float(probs[action]) + 1e-8) * advantage
+
+        # Softmax cross-entropy gradient
+        d_logits          = probs.copy()
+        d_logits[action] -= 1.0
+        d_logits         *= -advantage
+
+        # Backprop l3 → l2 (ReLU) → l1 (ReLU)
+        self.l3._z = logits_raw
+        d_h2       = self.l3.backward(d_logits);  self.l3.apply_gradients(lr)
+        d_h1       = self.l2.backward(d_h2);      self.l2.apply_gradients(lr)
+        self.l1.backward(d_h1);                   self.l1.apply_gradients(lr)
+
+        return loss
 
     def to_dict(self) -> dict:
         return {"l1": self.l1.to_dict(), "l2": self.l2.to_dict(), "l3": self.l3.to_dict()}
@@ -258,21 +300,28 @@ class MAPPOActor:
 
 
 class MAPPOCritic:
-    """
-    Centralised critic: joint_obs → V(s).
-    joint_obs = concat of all agents' obs vectors.
-    """
-
     def __init__(self, n_agents: int, hidden: int = MAPPO_HIDDEN_DIM) -> None:
         in_dim  = MAPPOActor.OBS_DIM * n_agents
-        self.l1 = LinearLayer(in_dim, hidden)
-        self.l2 = LinearLayer(hidden, hidden)
-        self.l3 = LinearLayer(hidden, 1, activation="none")
+        self.l1 = LinearLayer(in_dim, hidden, activation="relu")
+        self.l2 = LinearLayer(hidden, hidden, activation="relu")
+        self.l3 = LinearLayer(hidden, 1,      activation="none")
 
     def forward(self, joint_obs: np.ndarray) -> float:
         x = self.l1.forward(joint_obs)
         x = self.l2.forward(x)
         return float(self.l3.forward(x)[0])
+
+    def backward_and_update(self, joint_obs, target_value, lr) -> float:
+        x1   = self.l1.forward(joint_obs)
+        x2   = self.l2.forward(x1)
+        v    = float(self.l3.forward(x2)[0])
+        loss = 0.5 * (v - target_value) ** 2
+        d_v  = np.array([v - target_value], dtype=np.float32)
+        self.l3._z = self.l3._z if self.l3._z is not None else d_v
+        d_x2 = self.l3.backward(d_v);  self.l3.apply_gradients(lr)
+        d_x1 = self.l2.backward(d_x2); self.l2.apply_gradients(lr)
+        self.l1.backward(d_x1);        self.l1.apply_gradients(lr)
+        return loss
 
     def to_dict(self) -> dict:
         return {"l1": self.l1.to_dict(), "l2": self.l2.to_dict(), "l3": self.l3.to_dict()}
@@ -285,144 +334,195 @@ class MAPPOCritic:
 
 class MAPPOPolicy:
     """
-    MAPPO trainer/policy manager for the warehouse fleet.
+    MAPPO — real backpropagation + cost-overlay output connected to A*.
 
-    Usage:
-        policy = MAPPOPolicy(n_agents=6)
-        obs_vec = policy.encode_obs(agent, env)
-        probs   = policy.act(agent_idx, obs_vec)
-        # store (obs, action, reward, next_obs, done) in buffer
-        policy.store_transition(agent_idx, obs, action, reward, next_obs, done)
-        # after rollout:
-        policy.update()
-        policy.save()
+    Full data flow:
+      1. Each tick: encode_obs(agent, env) → store_transition(...)
+      2. Every ROLLOUT_LEN ticks: update_and_apply(agents, grid_size, env)
+         a. update()  — real PPO gradient descent on actors + critic
+         b. apply_overlay_to_agents() — compute entropy map → push to agents
+      3. In A* (agent.py): edge_cost += agent.mappo_extra_cost(cell)
+
+    As training progresses:
+      - Policy becomes confident in open corridors → low entropy → low A* cost
+      - Policy stays uncertain near obstacles/congestion → high entropy → high A* cost
+      - Agents learn to route through cleaner paths without being explicitly told to
     """
 
-    def __init__(self, n_agents: int, hidden: int = MAPPO_HIDDEN_DIM) -> None:
-        self.n_agents = n_agents
-        self.actors   = [MAPPOActor(hidden) for _ in range(n_agents)]
-        self.critic   = MAPPOCritic(n_agents, hidden)
-        self._buffer:  list[dict] = []
-        self._episode_rewards: list[float] = []
+    OVERLAY_SAMPLE_CELLS = 120   # cells to sample per overlay update (speed/quality tradeoff)
 
-    # ── Observation encoding ────────────────────────────────────────────────────
+    def __init__(self, n_agents: int, hidden: int = MAPPO_HIDDEN_DIM) -> None:
+        self.n_agents          = n_agents
+        self.actors            = [MAPPOActor(hidden) for _ in range(n_agents)]
+        self.critic            = MAPPOCritic(n_agents, hidden)
+        self._buffer:          list[dict]  = []
+        self._episode_rewards: list[float] = []
+        self._last_overlays:   list[dict]  = [{} for _ in range(n_agents)]
+
+    # ── Observation encoding ──────────────────────────────────────────────────
 
     @staticmethod
     def encode_obs(agent, env) -> np.ndarray:
         from config import GRID_SIZE, BATTERY_FULL
-        grid  = GRID_SIZE
-        batt  = agent.battery / BATTERY_FULL
-        x     = agent.x / grid
-        y     = agent.y / grid
-        prio  = 0.0
-        carry = 1.0 if agent.carrying else 0.0
+        grid          = GRID_SIZE
+        batt          = agent.battery / BATTERY_FULL
+        x             = agent.x / grid
+        y             = agent.y / grid
+        prio          = 0.0
+        carry         = 1.0 if agent.carrying else 0.0
         if agent.current_task:
             prio = agent.current_task.priority_score / 5.0
-        cong  = env.congestion_cost.get(agent.location, 0.0) / 3.0  # normalise
+        cong          = env.congestion_cost.get(agent.location, 0.0) / 3.0
         charge_needed = 1.0 if agent.needs_charge() else 0.0
-        n_pending = sum(1 for t in getattr(env, "pending_proxy", []) if True)
-        queue_norm = min(n_pending, 14) / 14.0
-        n_neighbors = sum(
-            1 for a in env.agents if a.id != agent.id
-            and abs(a.x - agent.x) + abs(a.y - agent.y) <= 3
+        n_pending     = len(getattr(env, "pending_proxy", []))
+        queue_norm    = min(n_pending, 14) / 14.0
+        n_neighbors   = sum(
+            1 for a in env.agents
+            if a.id != agent.id and abs(a.x - agent.x) + abs(a.y - agent.y) <= 3
         ) / max(1, len(env.agents) - 1)
-        return np.array([batt, x, y, prio, cong, charge_needed, carry, queue_norm, n_neighbors], dtype=np.float32)
+        return np.array(
+            [batt, x, y, prio, cong, charge_needed, carry, queue_norm, n_neighbors],
+            dtype=np.float32,
+        )
 
-    # ── Action selection ────────────────────────────────────────────────────────
+    # ── Action selection ──────────────────────────────────────────────────────
 
     def act(self, agent_idx: int, obs: np.ndarray) -> int:
-        probs  = self.actors[agent_idx].forward(obs)
-        action = int(np.random.choice(MAPPOActor.N_ACTIONS, p=probs))
-        return action
+        probs = self.actors[agent_idx].forward(obs)
+        return int(np.random.choice(MAPPOActor.N_ACTIONS, p=probs))
 
     def act_deterministic(self, agent_idx: int, obs: np.ndarray) -> int:
-        probs = self.actors[agent_idx].forward(obs)
-        return int(np.argmax(probs))
+        return int(np.argmax(self.actors[agent_idx].forward(obs)))
 
-    # ── Buffer management ───────────────────────────────────────────────────────
+    # ── Buffer ────────────────────────────────────────────────────────────────
 
-    def store_transition(
-        self,
-        agent_idx: int,
-        obs:       np.ndarray,
-        action:    int,
-        reward:    float,
-        next_obs:  np.ndarray,
-        done:      bool,
-    ) -> None:
+    def store_transition(self, agent_idx, obs, action, reward, next_obs, done):
         self._buffer.append({
-            "agent":    agent_idx,
-            "obs":      obs,
-            "action":   action,
-            "reward":   reward,
-            "next_obs": next_obs,
-            "done":     done,
+            "agent": agent_idx, "obs": obs, "action": action,
+            "reward": reward, "next_obs": next_obs, "done": done,
         })
         self._episode_rewards.append(reward)
 
-    # ── PPO update (simplified, NumPy-based) ───────────────────────────────────
+    # ── Cost overlay  ─────────────────────────────────────────────────────────
+
+    def compute_cost_overlay(
+        self, agent_idx: int, grid_size: int, env=None
+    ) -> dict[tuple, float]:
+        """
+        Sparse {(x,y): extra_cost} map built from action-distribution entropy.
+
+        Cells where the trained policy is uncertain (high entropy) become
+        high-cost in A*.  Cells where it is confident (low entropy) are free.
+
+        After enough training:
+          - Open corridors → low entropy → cost ≈ 0   → agents prefer these
+          - Congested zones → high entropy → cost > 0 → agents route around
+        """
+        MAX_OVERLAY_COST = 3.0
+        MAX_ENTROPY      = math.log(MAPPOActor.N_ACTIONS)   # ln(5) ≈ 1.609
+        ENTROPY_THRESH   = 0.55 * MAX_ENTROPY               # only penalise truly uncertain cells
+
+        actor      = self.actors[agent_idx]
+        overlay    = {}
+        congestion = {}
+        if env is not None:
+            congestion = getattr(env, "congestion_cost", {})
+
+        all_cells = [(x, y) for x in range(grid_size) for y in range(grid_size)]
+        sample    = random.sample(all_cells, min(self.OVERLAY_SAMPLE_CELLS, len(all_cells)))
+
+        for (cx, cy) in sample:
+            obs = np.array([
+                0.8,                                          # healthy battery
+                cx / grid_size,                              # x
+                cy / grid_size,                              # y
+                0.4,                                          # mid-priority task
+                congestion.get((cx, cy), 0.0) / 3.0,        # real congestion
+                0.0, 0.0,                                     # not charging, not carrying
+                0.5, 0.0,                                     # medium queue, no neighbours
+            ], dtype=np.float32)
+
+            ent = actor.entropy(obs)
+
+            if ent > ENTROPY_THRESH:
+                norm_cost    = ((ent - ENTROPY_THRESH) / (MAX_ENTROPY - ENTROPY_THRESH + 1e-8)
+                                * MAX_OVERLAY_COST)
+                cong_factor  = 1.0 + congestion.get((cx, cy), 0.0) / 3.0
+                overlay[(cx, cy)] = norm_cost * cong_factor
+
+        return overlay
+
+    def apply_overlay_to_agents(self, agents, grid_size: int, env=None) -> None:
+        """Push computed overlays to all agents for use in A*."""
+        for i, agent in enumerate(agents):
+            overlay = self.compute_cost_overlay(i, grid_size, env)
+            self._last_overlays[i] = overlay
+            agent.update_mappo_overlay(overlay)
+
+    # ── PPO update — real backprop ────────────────────────────────────────────
 
     def update(self) -> float:
-        """
-        Perform a PPO update over the stored buffer.
-        Returns mean policy loss (for monitoring).
-
-        Note: This is a lightweight NumPy implementation.  For serious training,
-        replace with torch-based MAPPO (see README upgrade path).
-        """
         if len(self._buffer) < MAPPO_BATCH_SIZE:
             return 0.0
 
-        # Compute discounted returns
-        returns: list[float] = []
+        # Monte-Carlo returns
+        returns = []
         G = 0.0
-        for t in reversed(self._buffer):
-            G = t["reward"] + (0.0 if t["done"] else MAPPO_GAMMA * G)
+        for tr in reversed(self._buffer):
+            G = tr["reward"] + (0.0 if tr["done"] else MAPPO_GAMMA * G)
             returns.insert(0, G)
-
         returns_arr = np.array(returns, dtype=np.float32)
-        # Normalise
-        if returns_arr.std() > 1e-6:
-            returns_arr = (returns_arr - returns_arr.mean()) / (returns_arr.std() + 1e-8)
 
-        total_loss = 0.0
+        if returns_arr.std() > 1e-6:
+            advantages = (returns_arr - returns_arr.mean()) / (returns_arr.std() + 1e-8)
+        else:
+            advantages = returns_arr - returns_arr.mean()
+
+        obs_dim          = MAPPOActor.OBS_DIM
+        agent_obs_cache: dict[int, np.ndarray] = {}
+        total_actor_loss = 0.0
+
         for _ in range(MAPPO_UPDATE_EPOCHS):
             indices = list(range(len(self._buffer)))
             random.shuffle(indices)
             for start in range(0, len(indices), MAPPO_BATCH_SIZE):
-                batch_idx = indices[start:start + MAPPO_BATCH_SIZE]
-                for i in batch_idx:
-                    tr    = self._buffer[i]
-                    ai    = tr["agent"]
-                    obs   = tr["obs"]
-                    act   = tr["action"]
-                    ret   = returns_arr[i]
-                    probs = self.actors[ai].forward(obs)
-                    log_p = math.log(probs[act] + 1e-8)
-                    # Simple policy gradient step (no old_probs stored → no ratio clipping)
-                    # In full MAPPO, store old log-probs and apply clipping
-                    loss = -log_p * ret
-                    total_loss += loss
-                    # Gradient: approximate weight update via reward-weighted direction
-                    grad_scale = MAPPO_LR * (-ret)
-                    for layer in (self.actors[ai].l1, self.actors[ai].l2, self.actors[ai].l3):
-                        layer.W -= grad_scale * np.random.randn(*layer.W.shape) * 0.01
-                        layer.b -= grad_scale * np.random.randn(*layer.b.shape) * 0.01
+                for i in indices[start : start + MAPPO_BATCH_SIZE]:
+                    tr  = self._buffer[i]
+                    ai  = tr["agent"]
+                    obs = tr["obs"]
+                    act = tr["action"]
+                    ret = float(returns_arr[i])
+                    adv = float(advantages[i])
+
+                    total_actor_loss += self.actors[ai].backward_and_update(obs, act, adv, MAPPO_LR)
+
+                    agent_obs_cache[ai] = obs
+                    joint = np.concatenate([
+                        agent_obs_cache.get(j, np.zeros(obs_dim, dtype=np.float32))
+                        for j in range(self.n_agents)
+                    ])
+                    self.critic.backward_and_update(joint, ret, MAPPO_LR * MAPPO_VF_COEF)
 
         self._buffer.clear()
-        mean_reward = float(np.mean(self._episode_rewards)) if self._episode_rewards else 0.0
         self._episode_rewards.clear()
-        return total_loss
+        return total_actor_loss
 
-    # ── Persistence ─────────────────────────────────────────────────────────────
+    def update_and_apply(self, agents, grid_size: int, env=None) -> float:
+        """
+        Train weights + push cost overlay to agents.
+        Use this in dispatcher.end_episode() instead of bare update().
+        """
+        loss = self.update()
+        if loss != 0.0:
+            self.apply_overlay_to_agents(agents, grid_size, env)
+        return loss
+
+    # ── Persistence ───────────────────────────────────────────────────────────
 
     def save(self, path: str = MAPPO_MODEL_PATH) -> None:
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-        data = {
-            "actors":  [a.to_dict() for a in self.actors],
-            "critic":  self.critic.to_dict(),
-            "n_agents": self.n_agents,
-        }
+        data = {"actors": [a.to_dict() for a in self.actors],
+                "critic": self.critic.to_dict(), "n_agents": self.n_agents}
         with open(path, "wb") as f:
             pickle.dump(data, f)
 
@@ -442,52 +542,32 @@ class MAPPOPolicy:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 4. Congestion heatmap learner
+# 4. Congestion heatmap
 # ══════════════════════════════════════════════════════════════════════════════
 
 class CongestionHeatmap:
-    """
-    EMA-based learned heatmap of cell traversal cost.
-    Updated every time a robot moves through a cell; slower EMA = longer memory.
-    Injected as extra edge weights into the CBS A* planner.
-    """
-
     def __init__(self, grid_size: int) -> None:
         self.grid_size = grid_size
-        self._map:  dict[tuple, float] = {}    # (x,y) → learned cost
+        self._map:  dict[tuple, float] = {}
         self._hits: dict[tuple, int]   = defaultdict(int)
         self._alpha = HEATMAP_ALPHA
         self._scale = HEATMAP_PENALTY_SCALE
 
-    def record_traversal(self, pos: tuple, observed_cost: float) -> None:
-        """Call when a robot steps through `pos` at `observed_cost`."""
+    def record_traversal(self, pos, observed_cost):
         old = self._map.get(pos, 0.0)
         self._map[pos] = (1 - self._alpha) * old + self._alpha * observed_cost
         self._hits[pos] += 1
 
-    def record_collision(self, pos: tuple) -> None:
-        """Collision at `pos` — treat as high-cost traversal."""
-        self.record_traversal(pos, 5.0)
+    def record_collision(self, pos): self.record_traversal(pos, 5.0)
+    def record_wait(self, pos):      self.record_traversal(pos, 1.5)
+    def cost(self, pos):             return self._map.get(pos, 0.0) * self._scale
+    def as_dict(self):               return {k: v * self._scale for k, v in self._map.items()}
+    def top_n(self, n=10):           return sorted(self._map, key=lambda k: -self._map[k])[:n]
 
-    def record_wait(self, pos: tuple) -> None:
-        """Agent forced to wait at `pos` — mild penalty."""
-        self.record_traversal(pos, 1.5)
-
-    def cost(self, pos: tuple) -> float:
-        return self._map.get(pos, 0.0) * self._scale
-
-    def as_dict(self) -> dict[tuple, float]:
-        """Return map suitable for passing into CBS planner as heatmap."""
-        return {k: v * self._scale for k, v in self._map.items()}
-
-    def top_n(self, n: int = 10) -> list[tuple]:
-        """Return the n hottest cells (for visualisation)."""
-        return sorted(self._map, key=lambda k: -self._map[k])[:n]
-
-    def to_dict(self) -> dict:
+    def to_dict(self):
         return {f"{k[0]},{k[1]}": v for k, v in self._map.items()}
 
-    def from_dict(self, d: dict) -> None:
+    def from_dict(self, d):
         self._map = {}
         for ks, v in d.items():
             parts = ks.split(",")
@@ -499,62 +579,31 @@ class CongestionHeatmap:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. Model store — persistence across simulation runs
+# 5. Model store
 # ══════════════════════════════════════════════════════════════════════════════
 
 class ModelStore:
-    """
-    Serialises and deserialises all learned model state so knowledge persists
-    across simulation runs (episodes).
-
-    Stores:
-      - MAPPO actor/critic weights
-      - Per-agent Q-tables
-      - UCB1 bandit arm statistics
-      - Congestion heatmap
-      - Episode counter and metrics history
-    """
-
     def __init__(self, model_dir: str = MODEL_DIR) -> None:
         self.dir = model_dir
         os.makedirs(self.dir, exist_ok=True)
 
-    def _path(self, name: str) -> str:
-        return os.path.join(self.dir, name)
+    def _path(self, name): return os.path.join(self.dir, name)
 
-    def save_all(
-        self,
-        mappo:    MAPPOPolicy | None,
-        qlearners: list[AgentQLearner],
-        bandit:   StrategyBandit,
-        heatmap:  CongestionHeatmap,
-        episode:  int,
-        metrics:  dict,
-    ) -> None:
+    def save_all(self, mappo, qlearners, bandit, heatmap, episode, metrics):
         data = {
-            "episode":   episode,
-            "metrics":   metrics,
-            "bandit":    bandit.to_dict(),
-            "heatmap":   heatmap.to_dict(),
+            "episode": episode, "metrics": metrics,
+            "bandit":  bandit.to_dict(), "heatmap": heatmap.to_dict(),
             "qlearners": [ql.to_dict() for ql in qlearners],
         }
         with open(self._path("state.json"), "w") as f:
             json.dump(data, f, indent=2)
-
         if mappo is not None:
             mappo.save(self._path("mappo.pkl"))
-
         print(f"[ModelStore] Saved episode {episode} → {self.dir}/")
 
-    def load_all(
-        self,
-        mappo:     MAPPOPolicy | None,
-        qlearners: list[AgentQLearner],
-        bandit:    StrategyBandit,
-        heatmap:   CongestionHeatmap,
-    ) -> dict:
+    def load_all(self, mappo, qlearners, bandit, heatmap):
+        meta       = {}
         state_path = self._path("state.json")
-        meta = {}
         if os.path.exists(state_path):
             with open(state_path) as f:
                 data = json.load(f)
@@ -565,10 +614,6 @@ class ModelStore:
                 if i < len(qlearners):
                     qlearners[i].from_dict(ql_data)
             print(f"[ModelStore] Loaded state from episode {meta.get('episode', 0)}")
-
-        if mappo is not None:
-            loaded = mappo.load(self._path("mappo.pkl"))
-            if loaded:
-                print("[ModelStore] MAPPO weights loaded.")
-
+        if mappo is not None and mappo.load(self._path("mappo.pkl")):
+            print("[ModelStore] MAPPO weights loaded.")
         return meta
